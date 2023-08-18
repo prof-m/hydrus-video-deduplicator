@@ -50,6 +50,8 @@ if in_wsl():
 
 HYDRUS_API_URL = os.getenv("HYDRUS_API_URL", f"https://{_DEFAULT_IP}:{_DEFAULT_PORT}")
 
+PARALLEL_JOB_COUNT = os.getenv("PARALLEL_JOB_COUNT", -2)
+
 # ~/.local/share/hydrusvideodeduplicator/ on Linux
 _DEDUP_DATABASE_DIR_ENV = PlatformDirs("hydrusvideodeduplicator").user_data_dir
 _DEDUP_DATABASE_DIR_ENV = os.getenv("DEDUP_DATABASE_DIR", _DEDUP_DATABASE_DIR_ENV)
@@ -63,6 +65,9 @@ REQUESTS_CA_BUNDLE = os.getenv("REQUESTS_CA_BUNDLE")
 _PDQ_DATABASE_NAME = os.getenv("DEDUP_DATABASE_NAME", "pdq")
 PDQ_DATABASE_FILE = Path(DEDUP_DATABASE_DIR, f"{_PDQ_DATABASE_NAME}.sqlite")
 PDQ_TABLE_NAME = "potential_duplicates_queue"
+
+_FAILED_VIDEOS_LOG_FILE_NAME = os.getenv("FAILED_VIDEOS_LOG_FILE_NAME", "failed_videos_log.txt")
+FAILED_VIDEOS_LOG_FILE = Path(DEDUP_DATABASE_DIR, _FAILED_VIDEOS_LOG_FILE_NAME)
 
 USE_POTENTIAL_DUPES_QUEUE = True if os.getenv("USE_POTENTIAL_DUPES_QUEUE") else False
 PDQ_FLUSH_COUNT = os.getenv("PDQ_FLUSH_COUNT", 16)

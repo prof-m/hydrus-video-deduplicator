@@ -15,6 +15,7 @@ from .config import (
     REQUESTS_CA_BUNDLE,
     USE_POTENTIAL_DUPES_QUEUE,
     ONLY_SEND_QUEUED_DUPES,
+    PARALLEL_JOB_COUNT,
 )
 from .dedup import HydrusVideoDeduplicator
 from .pdq import PotentialDuplicatesQueue
@@ -52,7 +53,16 @@ def main(
     clear_search_cache: Annotated[
         Optional[bool], typer.Option(help="Clear the cache that tracks what files have already been compared")
     ] = False,
-    job_count: Annotated[Optional[int], typer.Option(help="Number of CPUs to use. Default is all but one core.")] = -2,
+    job_count: Annotated[Optional[int], typer.Option(help="Number of CPUs to use. Default is all but one core.")] = int(
+        PARALLEL_JOB_COUNT
+    ),
+    failed_videos_page: Annotated[
+        Optional[str],
+        typer.Option(
+            help="Name of page to add any failed files to. Page MUST already be created in your Hydrus client before "
+            "running."
+        ),
+    ] = None,
     verbose: Annotated[Optional[bool], typer.Option(help="Verbose logging")] = False,
     debug: Annotated[Optional[bool], typer.Option(hidden=True)] = False,
 ):
@@ -104,6 +114,7 @@ def main(
             hydrus_client,
             file_service_keys=file_service_key,
             job_count=job_count,
+            failed_videos_page=failed_videos_page,
         )
     except hydrus_api.InsufficientAccess as exc:
         error_connecting_exception_msg = "Invalid Hydrus API key."
