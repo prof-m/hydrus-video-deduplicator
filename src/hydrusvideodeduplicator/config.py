@@ -5,6 +5,7 @@ from platform import uname
 
 from dotenv import load_dotenv
 from platformdirs import PlatformDirs
+from environs import Env
 
 
 class InvalidEnvironmentVariable(Exception):
@@ -40,6 +41,9 @@ def in_wsl() -> bool:
     return 'microsoft-standard' in uname().release
 
 
+env = Env()
+env.read_env()
+
 _DEFAULT_IP = "localhost"
 _DEFAULT_PORT = "45869"
 # If you're in WSL you probably want to connect to your Windows Hydrus Client by default
@@ -69,9 +73,11 @@ _PDQ_DATABASE_NAME = os.getenv("DEDUP_DATABASE_NAME", "pdq")
 PDQ_DATABASE_FILE = Path(DEDUP_DATABASE_DIR, f"{_PDQ_DATABASE_NAME}.sqlite")
 PDQ_TABLE_NAME = "potential_duplicates_queue"
 
-USE_POTENTIAL_DUPES_QUEUE = True if os.getenv("USE_POTENTIAL_DUPES_QUEUE") else False
+USE_POTENTIAL_DUPES_QUEUE = env.bool("USE_POTENTIAL_DUPES_QUEUE", False)
 PDQ_FLUSH_COUNT = os.getenv("PDQ_FLUSH_COUNT", 16)
-ONLY_SEND_QUEUED_DUPES = True if os.getenv("ONLY_SEND_QUEUED_DUPES") else False
+ONLY_SEND_QUEUED_DUPES = env.bool("ONLY_SEND_QUEUED_DUPES", False)
+
+USE_ALTERNATE_DUPE_CHECK = env.bool("USE_ALTERNATE_DUPE_CHECK", False)
 
 # Optional query for selecting files to process
 _HYDRUS_QUERY_ENV = os.getenv("HYDRUS_QUERY")

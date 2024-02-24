@@ -14,12 +14,12 @@ from tqdm import tqdm
 
 if TYPE_CHECKING:
     from collections.abc import Generator, Iterable, Sequence
-    from typing import Any
+    from typing import Any, Optional
 
 import hydrusvideodeduplicator.hydrus_api as hydrus_api
 import hydrusvideodeduplicator.hydrus_api.utils as hydrus_api_utils
 
-from .config import DEDUP_DATABASE_DIR, DEDUP_DATABASE_FILE
+from .config import DEDUP_DATABASE_DIR, DEDUP_DATABASE_FILE, USE_ALTERNATE_DUPE_CHECK
 from .dedup_util import database_accessible, get_potential_duplicate_count_hydrus
 from .pdq import PotentialDuplicatesQueue, Relationship
 from .fvl import FailedVideoLogger
@@ -34,12 +34,12 @@ class HydrusVideoDeduplicator:
     _DEBUG = False
 
     def __init__(
-        self,
-        client: hydrus_api.Client,
-        verify_connection: bool = True,
-        file_service_keys: Sequence[str] | None = None,
-        job_count: int = -2,
-        failed_videos_page: str | None = None,
+            self,
+            client: hydrus_api.Client,
+            verify_connection: bool = True,
+            file_service_keys: Sequence[str] | None = None,
+            job_count: int = -2,
+            failed_videos_page: str | None = None,
     ):
         self.client = client
         if verify_connection:
@@ -88,10 +88,10 @@ class HydrusVideoDeduplicator:
                 raise KeyError("File service key must be a local file service")
 
     def deduplicate(
-        self,
-        overwrite: bool = False,
-        custom_query: Sequence[str] | None = None,
-        skip_hashing: bool = False,
+            self,
+            overwrite: bool = False,
+            custom_query: Sequence[str] | None = None,
+            skip_hashing: bool = False,
     ) -> None:
         """
         Run all deduplicate functions:
@@ -115,13 +115,15 @@ class HydrusVideoDeduplicator:
                 search_tags.extend(custom_query)
                 print(f"[yellow] Custom Query: {custom_query}")
 
+        original_db_size = None
+
         if skip_hashing:
             print("[yellow] Skipping perceptual hashing")
         else:
             video_hashes = list(self.retrieve_video_hashes(search_tags))
-            self.add_perceptual_hashes_to_db(overwrite=overwrite, video_hashes=video_hashes)
+            original_db_size = self.add_perceptual_hashes_to_db(overwrite=overwrite, video_hashes=video_hashes)
 
-        self._find_potential_duplicates()
+        self._find_potential_duplicates(original_db_size)
 
         self.hydlog.info("Deduplication done.")
 
@@ -167,7 +169,7 @@ class HydrusVideoDeduplicator:
         else:
             return PHashedVideo(video_hash, perceptual_hash, True, None)
 
-    def add_perceptual_hashes_to_db(self, overwrite: bool, video_hashes: Sequence[str]) -> None:
+    def add_perceptual_hashes_to_db(self, overwrite: bool, video_hashes: Sequence[str]) -> int:
         """
         Retrieves the video from Hydrus,
         calculates the perceptual hash,
@@ -182,8 +184,10 @@ class HydrusVideoDeduplicator:
         except OSError:
             pass
 
+        original_db_size = 0
+
         with SqliteDict(
-            str(DEDUP_DATABASE_FILE), tablename="videos", flag="c", autocommit=True, outer_stack=False
+                str(DEDUP_DATABASE_FILE), tablename="videos", flag="c", autocommit=True, outer_stack=False
         ) as hashdb:
             dbsize = os.path.getsize(DEDUP_DATABASE_FILE)
 
@@ -203,6 +207,8 @@ class HydrusVideoDeduplicator:
                     for video_hash in video_hashes
                     if video_hash not in hashdb or "perceptual_hash" not in hashdb[video_hash]
                 ]
+                # Set original db size
+                original_db_size = len(hashdb)
 
             print(f"[blue] Found {len(new_video_hashes)} videos to process")
 
@@ -239,6 +245,7 @@ class HydrusVideoDeduplicator:
             finally:
                 print(f"[green] Added {hash_count} new videos to the database.")
                 self.failed_files.finish()
+                return original_db_size
 
     def compare_videos(self, video1_hash: str, video2_hash: str, video1_phash: str, video2_phash: str) -> None:
         """Compare videos and mark them as potential duplicates in Hydrus if they are similar."""
@@ -260,6 +267,32 @@ class HydrusVideoDeduplicator:
             else:
                 self.client.set_file_relationships([new_relationship])
 
+    def compare_video(self, video1_hash: str, hashdb: SqliteDict) -> str:
+        """Compare videos and mark them as potential duplicates in Hydrus if they are similar."""
+
+        vpdq_hash1 = Vpdq.json_to_vpdq(hashdb[video1_hash]["perceptual_hash"])
+
+        for video2_hash in islice(hashdb, hashdb[video1_hash]["farthest_search_index"], None):
+            video2_phash = hashdb[video2_hash]["perceptual_hash"]
+            vpdq_hash2 = Vpdq.json_to_vpdq(video2_phash)
+            similar, similarity = Vpdq.is_similar(vpdq_hash1, vpdq_hash2, self.threshold)
+
+            if similar:
+                if self._DEBUG:
+                    # Getting the file names will be VERY slow because of the API call
+                    # file_names = get_file_names_hydrus(self.client, [video1_hash, video2_hash])
+                    # self.hydlog.info(f"Duplicates filenames: {file_names}")
+                    self.hydlog.info(f"\"Similar {similarity}%: {video1_hash}\" and \"{video2_hash}\"")
+
+                new_relationship = Relationship(str(video1_hash), str(video2_hash))
+
+                if self.potential_dupe_queue:
+                    self.potential_dupe_queue.add(new_relationship)
+                else:
+                    self.client.set_file_relationships([new_relationship])
+
+        return video1_hash
+
     @staticmethod
     def clear_search_cache() -> None:
         """Delete cache search index value for each video in database"""
@@ -276,7 +309,7 @@ class HydrusVideoDeduplicator:
         print("[green] Cleared search cache.")
 
     def _find_potential_duplicates(
-        self,
+            self, original_db_length: Optional[int] = None
     ) -> None:
         """Find potential duplicates in the database and mark them in Hydrus."""
         if not database_accessible(DEDUP_DATABASE_FILE, tablename="videos", verbose=True):
@@ -288,54 +321,82 @@ class HydrusVideoDeduplicator:
 
         video_counter = 0
         with SqliteDict(
-            str(DEDUP_DATABASE_FILE), tablename="videos", flag="c", autocommit=True, outer_stack=False
+                str(DEDUP_DATABASE_FILE), tablename="videos", flag="c", autocommit=True, outer_stack=False
         ) as hashdb:
+            hashdb_size = len(hashdb)
             try:
-                total = len(hashdb)
+                if USE_ALTERNATE_DUPE_CHECK and original_db_length is not None:
+                    print("[green] NOTE: Using ALTERNATE parallelization when checking dupes.")
+                    videos_to_check = {}
 
-                with tqdm(
-                    dynamic_ncols=True, total=total, desc="Finding duplicates", unit="video", colour="BLUE"
-                ) as pbar:
-                    # -1 is all cores, -2 is all cores but one
-                    with Parallel(n_jobs=self.job_count, require='sharedmem') as parallel:
-                        for i, video1_hash in enumerate(hashdb):
-                            video_counter += 1
-                            pbar.update(1)
+                    for video_hash in hashdb:
+                        row = hashdb[video_hash]
+                        farthest_search_index = row.setdefault("farthest_search_index", 0)
+                        if farthest_search_index < original_db_length:
+                            videos_to_check[video_hash] = row
 
-                            row = hashdb[video1_hash]
-
-                            # Store last furthest searched position in the database for each element
-                            # This way you only have to start searching at that place instead of at i+1 if it exists
-                            farthest_search_index = row.setdefault("farthest_search_index", i + 1)
-
-                            assert farthest_search_index <= total
-                            if farthest_search_index == total:
-                                # This file has already been searched for dupes against all other videos in the DB
-                                continue
-
-                            parallel(
-                                delayed(self.compare_videos)(
+                    total = len(videos_to_check)
+                    with tqdm(
+                            dynamic_ncols=True, total=total, desc="Finding duplicates", unit="video", colour="BLUE"
+                    ) as pbar:
+                        with Parallel(n_jobs=self.job_count, require='sharedmem', return_as='generator') as parallel:
+                            result_generator = parallel(
+                                delayed(self.compare_video)(
                                     video1_hash,
-                                    video2_hash,
-                                    row["perceptual_hash"],
-                                    hashdb[video2_hash]["perceptual_hash"],
-                                )
-                                for video2_hash in islice(hashdb, row["farthest_search_index"], None)
-                            )
+                                    hashdb
+                                ) for video1_hash in videos_to_check)
 
-                            # Video has now been compared against all other videos for dupes,
-                            # so update farthest_search_index to the current length of the table
-                            row["farthest_search_index"] = total
-                            hashdb[video1_hash] = row
+                            for processed_video_hash in result_generator:
+                                pbar.update(1)
+                                hashdb[processed_video_hash]["farthest_search_index"] = hashdb_size
+
+                else:
+                    print("[green] Note: Using NORMAL parallelization when checking dupes")
+                    total = hashdb_size
+                    with tqdm(
+                            dynamic_ncols=True, total=total, desc="Finding duplicates", unit="video", colour="BLUE"
+                    ) as pbar:
+                        # -1 is all cores, -2 is all cores but one
+                        with Parallel(n_jobs=self.job_count, require='sharedmem') as parallel:
+                            for i, video1_hash in enumerate(hashdb):
+                                video_counter += 1
+                                pbar.update(1)
+
+                                row = hashdb[video1_hash]
+
+                                # Store last furthest searched position in the database for each element
+                                # This way you only have to start searching at that place instead of at i+1 if it exists
+                                farthest_search_index = row.setdefault("farthest_search_index", i + 1)
+
+                                assert farthest_search_index <= total
+                                if farthest_search_index == total:
+                                    # This file has already been searched for dupes against all other videos in the DB
+                                    continue
+
+                                parallel(
+                                    delayed(self.compare_videos)(
+                                        video1_hash,
+                                        video2_hash,
+                                        row["perceptual_hash"],
+                                        hashdb[video2_hash]["perceptual_hash"],
+                                    )
+                                    for video2_hash in islice(hashdb, row["farthest_search_index"], None)
+                                )
+
+                                # Video has now been compared against all other videos for dupes,
+                                # so update farthest_search_index to the current length of the table
+                                row["farthest_search_index"] = total
+                                hashdb[video1_hash] = row
 
             except KeyboardInterrupt:
                 print("[yellow] Duplicate search was interrupted!")
             else:
-                # Set the last element farthest_search_index to the end of the
-                # table since it won't get hashed because of the islice optimization
-                row = hashdb[video1_hash]
-                row["farthest_search_index"] = total
-                hashdb[video1_hash] = row
+                if 'video1_hash' in locals():
+                    # Set the last element farthest_search_index to the end of the
+                    # table since it won't get hashed because of the islice optimization
+                    row = hashdb[video1_hash]
+                    row["farthest_search_index"] = total
+                    hashdb[video1_hash] = row
 
         if self.potential_dupe_queue:
             try:
@@ -369,9 +430,9 @@ class HydrusVideoDeduplicator:
 
     @staticmethod
     def batched_and_save_db(
-        db: SqliteDict,
-        batch_size: int = 1,
-        chunk_size: int = 1,
+            db: SqliteDict,
+            batch_size: int = 1,
+            chunk_size: int = 1,
     ) -> Generator[dict[str, dict[str, Any]], Any, None]:
         """
         Batch rows of into rows of length n and save changes after each batch or after chunk_size batches.
@@ -446,11 +507,11 @@ class HydrusVideoDeduplicator:
                 print(f"[blue] Database found with {total} videos already hashed.")
                 try:
                     with tqdm(
-                        dynamic_ncols=True,
-                        total=total,
-                        desc="Clearing trashed videos",
-                        unit="video",
-                        colour="BLUE",
+                            dynamic_ncols=True,
+                            total=total,
+                            desc="Clearing trashed videos",
+                            unit="video",
+                            colour="BLUE",
                     ) as pbar:
                         BATCH_SIZE = 32
                         for batched_items in self.batched_and_save_db(hashdb, BATCH_SIZE):
