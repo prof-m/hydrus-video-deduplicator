@@ -273,6 +273,9 @@ class HydrusVideoDeduplicator:
         vpdq_hash1 = Vpdq.json_to_vpdq(hashdb[video1_hash]["perceptual_hash"])
 
         for video2_hash in islice(hashdb, hashdb[video1_hash]["farthest_search_index"], None):
+            if video1_hash == video2_hash:
+                continue
+
             video2_phash = hashdb[video2_hash]["perceptual_hash"]
             vpdq_hash2 = Vpdq.json_to_vpdq(video2_phash)
             similar, similarity = Vpdq.is_similar(vpdq_hash1, vpdq_hash2, self.threshold)
@@ -332,6 +335,7 @@ class HydrusVideoDeduplicator:
                     for video_hash in hashdb:
                         row = hashdb[video_hash]
                         farthest_search_index = row.setdefault("farthest_search_index", 0)
+                        hashdb[video_hash] = row
                         if farthest_search_index < original_db_length:
                             videos_to_check[video_hash] = row
 
